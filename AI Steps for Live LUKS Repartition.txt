@@ -1,0 +1,192 @@
+# This guide outlines the steps to install the OS onto an encrypted NVMe drive for Jetson Orin DevKit.
+# Run these commands from the default eMMC OS. This will wipe the NVMe drive.
+# Assumes NVMe is /dev/nvme0n1. Verify your device paths.
+
+
+### EXTRA NOTES TO FACTOR IN ###
+# Jetson Orin boots via extlinux.conf on the eMMC by default — not from NVMe.
+# You’ll need to ensure /boot remains on eMMC and that extlinux.conf points to your encrypted NVMe root volume.
+
+
+# Critical Test Before Production #
+# Before considering this production-ready:
+
+#1) Test the boot process - Reboot and ensure it actually unlocks
+#2) Verify all partitions mount - Run df -h and mount after boot
+#3) Check initramfs contents: lsinitramfs /boot/initrd.img-$(uname -r) | grep -E "cryptsetup|lvm|luks"
+#4) Test keyfile - Ensure it's being read correctly
+
+
+
+
+
+
+# ------------------------------------
+## 1. Prepare NVMe Drive
+# ------------------------------------
+
+# Install required tools
+sudo apt update
+sudo apt install cryptsetup-initramfs lvm2 -y
+
+# Create LUKS container (with discard/TRIM support)
+sudo cryptsetup --allow-discards luksFormat /dev/nvme0n1
+
+# Open container
+sudo cryptsetup luksOpen /dev/nvme0n1 nvme_crypt
+
+# Create LVM Physical Volume
+sudo pvcreate /dev/mapper/nvme_crypt
+
+# Create Volume Group
+sudo vgcreate vg_encrypted /dev/mapper/nvme_crypt
+
+# Create Logical Volumes (adjust sizes as needed)
+sudo lvcreate -n lv_root -L 50G vg_encrypted
+sudo lvcreate -n lv_var -L 15G vg_encrypted
+sudo lvcreate -n lv_var_log -L 10G vg_encrypted
+sudo lvcreate -n lv_var_log_audit -L 5G vg_encrypted
+sudo lvcreate -n lv_tmp -L 10G vg_encrypted
+sudo lvcreate -n lv_home -L 20G vg_encrypted
+sudo lvcreate -n lv_swap -L 8G vg_encrypted
+
+# ------------------------------------
+## 2. Format and Copy System
+# ------------------------------------
+
+# Format LVs
+sudo mkfs.ext4 /dev/vg_encrypted/lv_root
+sudo mkfs.ext4 /dev/vg_encrypted/lv_var
+sudo mkfs.ext4 /dev/vg_encrypted/lv_var_log
+sudo mkfs.ext4 /dev/vg_encrypted/lv_var_log_audit
+sudo mkfs.ext4 /dev/vg_encrypted/lv_tmp
+sudo mkfs.ext4 /dev/vg_encrypted/lv_home
+sudo mkswap /dev/vg_encrypted/lv_swap
+
+# Mount new LVs
+sudo mount /dev/vg_encrypted/lv_root /mnt
+sudo mkdir -p /mnt/{var,tmp,home}
+sudo mount /dev/vg_encrypted/lv_var /mnt/var
+sudo mkdir -p /mnt/var/log /mnt/var/log/audit
+sudo mount /dev/vg_encrypted/lv_var_log /mnt/var/log
+sudo mount /dev/vg_encrypted/lv_var_log_audit /mnt/var/log/audit
+sudo mount /dev/vg_encrypted/lv_tmp /mnt/tmp
+sudo mount /dev/vg_encrypted/lv_home /mnt/home
+
+# Copy eMMC OS to NVMe
+sudo rsync -aAXv --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/mnt/*","/media/*","/run/*","/swapfile"} / /mnt
+
+# Before chrooting, identify boot partition UUID
+BOOT_UUID=$(sudo blkid -s UUID -o value /dev/mmcblk0p1)
+echo "Boot partition UUID: $BOOT_UUID"
+# You'll need this for /etc/fstab inside chroot
+
+# ------------------------------------
+## 3. Chroot & Re-configure
+# ------------------------------------
+
+# Mount bind special filesystems
+sudo mount --bind /dev /mnt/dev
+sudo mount --bind /proc /mnt/proc
+sudo mount --bind /sys /mnt/sys
+
+# Enter the new system
+sudo chroot /mnt
+
+# --- [ COMMANDS BELOW ARE INSIDE CHROOT ] ---
+
+# Verify and mount eMMC boot partition
+umount /boot 2>/dev/null || true
+mount /dev/mmcblk0p1 /boot
+# (Also mount /boot/efi if you have one)
+
+# Create keyfile for boot unlock (store on /boot, NOT in /root)
+dd if=/dev/urandom of=/boot/luks.key bs=4096 count=1
+chmod 0400 /boot/luks.key
+cryptsetup luksAddKey /dev/nvme0n1 /boot/luks.key
+
+# Configure /etc/crypttab
+UUID=$(cryptsetup luksUUID /dev/nvme0n1)
+echo "nvme_crypt UUID=$UUID /boot/luks.key luks,discard" >> /etc/crypttab
+
+# Configure /etc/fstab
+# BACKUP YOUR OLD ONE FIRST: mv /etc/fstab /etc/fstab.emmc
+# Then, create a new /etc/fstab.
+# ---
+# nano /etc/fstab
+# ---
+# Example fstab content:
+#
+# /dev/vg_encrypted/lv_root          /                 ext4    defaults                     0 1
+# /dev/vg_encrypted/lv_home          /home             ext4    defaults,nodev               0 2
+# /dev/vg_encrypted/lv_tmp           /tmp              ext4    defaults,nodev,nosuid,noexec 0 2
+# /dev/vg_encrypted/lv_var           /var              ext4    defaults,nosuid              0 2
+# /dev/vg_encrypted/lv_var_log       /var/log          ext4    defaults,nodev,nosuid,noexec 0 2
+# /dev/vg_encrypted/lv_var_log_audit /var/log/audit    ext4    defaults,nodev,nosuid,noexec 0 2
+# /dev/vg_encrypted/lv_swap          none              swap    sw                           0 0
+#
+# UUID=<BOOT_UUID>                   /boot             vfat    defaults                     0 2
+#
+# ---
+
+# Ensure LUKS and LVM are included in initramfs
+echo "CRYPTSETUP=y" >> /etc/cryptsetup-initramfs/conf-hook
+echo lvm2 >> /etc/initramfs-tools/modules
+update-initramfs -u -k all
+
+# Update bootloader
+# ---
+# nano /boot/extlinux/extlinux.conf
+# ---
+# Find the 'APPEND' line.
+# Change:
+#   root=/dev/mmcblk0p1 ...
+# To:
+#   APPEND ${cbootargs} root=/dev/mapper/vg_encrypted-lv_root rootfstype=ext4 rootwait rw
+#
+# CRITICAL: Do NOT add "cryptdevice=" - that's for GRUB only!
+# The initramfs handles LUKS unlock via /etc/crypttab automatically.
+# Keep any other existing parameters (like quiet, splash, etc.)
+
+# Backup boot files
+cp /boot/initrd.img-* /boot/initrd.img-backup
+cp /boot/extlinux/extlinux.conf /boot/extlinux/extlinux.conf.bak
+
+# Verify critical configuration before leaving chroot
+cat /etc/crypttab
+cat /etc/fstab
+ls -la /boot/luks.key
+cat /boot/extlinux/extlinux.conf
+
+# --- [ LEAVE CHROOT ] ---
+exit
+
+# ------------------------------------
+## 4. Finalize and Reboot
+# ------------------------------------
+
+# Unmount all new filesystems
+sudo umount /mnt/boot
+sudo umount /mnt/var/log/audit
+sudo umount /mnt/var/log
+sudo umount /mnt/var
+sudo umount /mnt/tmp
+sudo umount /mnt/home
+sudo umount /mnt/dev
+sudo umount /mnt/proc
+sudo umount /mnt/sys
+sudo umount /mnt
+
+# Close encrypted container
+sudo cryptsetup luksClose nvme_crypt
+
+# ------------------------------------
+## 5. Recovery and Reboot
+# ------------------------------------
+
+# IMPORTANT: Keep the eMMC bootable as a recovery option!
+# Do NOT modify or erase the eMMC root filesystem yet.
+# If NVMe boot fails, you can boot from eMMC and troubleshoot.
+
+# Reboot and boot from NVMe (root on encrypted LUKS, bootloader on eMMC)
+sudo reboot
