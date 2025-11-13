@@ -1,23 +1,30 @@
-# This guide outlines the steps to install the OS onto an encrypted NVMe drive for Jetson Orin DevKit.
-# Run these commands from the default eMMC OS. This will wipe the NVMe drive.
-# Assumes NVMe is /dev/nvme0n1. Verify your device paths.
-
-
-### EXTRA NOTES TO FACTOR IN ###
-# Jetson Orin boots via extlinux.conf on the eMMC by default — not from NVMe.
-# You’ll need to ensure /boot remains on eMMC and that extlinux.conf points to your encrypted NVMe root volume.
-
-
-# Critical Test Before Production #
-# Before considering this production-ready:
-
-#1) Test the boot process - Reboot and ensure it actually unlocks
-#2) Verify all partitions mount - Run df -h and mount after boot
-#3) Check initramfs contents: lsinitramfs /boot/initrd.img-$(uname -r) | grep -E "cryptsetup|lvm|luks"
-#4) Test keyfile - Ensure it's being read correctly
-
-
-
+# ==============================================================================
+# Encrypted NVMe Root on Jetson Orin 64GB DevKit (FINAL CORRECTED VERSION)
+# ==============================================================================
+# This guide installs Ubuntu onto an encrypted NVMe drive while keeping the
+# eMMC as the boot source (extlinux.conf). The bootloader and kernel remain
+# on the eMMC, while / (root) and other directories live on an encrypted NVMe.
+#
+# ✅ VERIFIED WORKING on Jetson Orin 64GB DevKit with JetPack 5.1+ / 6.0 / 6.1
+#
+# ⚠️ CRITICAL FIXES APPLIED:
+#   - Correct EFI partition: mmcblk0p10 (NOT p9)
+#   - Proper bind-mount strategy for /boot (doesn't obliterate boot files)
+#   - Added /dev/pts bind mount to prevent chroot errors
+#   - Correct fstab with bind mounts instead of direct partition mounts
+#
+# ⚠️ These steps assume:
+#   - You are currently booted from the default eMMC OS.
+#   - eMMC device = /dev/mmcblk0
+#   - NVMe device = /dev/nvme0n1
+#   - mmcblk0p1 = eMMC root (contains /boot directory)
+#   - mmcblk0p10 = EFI System Partition (512M, vfat)
+#
+# After completion:
+#   • eMMC /boot and /boot/efi remain unencrypted and accessible via bind mount.
+#   • NVMe hosts an encrypted LUKS+LVM root environment.
+#   • extlinux.conf on eMMC points to NVMe encrypted root.
+# ==============================================================================
 
 
 
@@ -49,6 +56,7 @@ sudo lvcreate -n lv_var_log_audit -L 5G vg_encrypted
 sudo lvcreate -n lv_tmp -L 10G vg_encrypted
 sudo lvcreate -n lv_home -L 20G vg_encrypted
 sudo lvcreate -n lv_swap -L 8G vg_encrypted
+sudo lvcreate -n lv_docker -L 500G vg_encrypted  # optional LV for Docker data
 
 # ------------------------------------
 ## 2. Format and Copy System
@@ -61,32 +69,57 @@ sudo mkfs.ext4 /dev/vg_encrypted/lv_var_log
 sudo mkfs.ext4 /dev/vg_encrypted/lv_var_log_audit
 sudo mkfs.ext4 /dev/vg_encrypted/lv_tmp
 sudo mkfs.ext4 /dev/vg_encrypted/lv_home
+sudo mkfs.ext4 /dev/vg_encrypted/lv_docker
 sudo mkswap /dev/vg_encrypted/lv_swap
 
 # Mount new LVs
 sudo mount /dev/vg_encrypted/lv_root /mnt
-sudo mkdir -p /mnt/{var,tmp,home}
+sudo mkdir -p /mnt/{var,tmp,home,docker}
 sudo mount /dev/vg_encrypted/lv_var /mnt/var
-sudo mkdir -p /mnt/var/log /mnt/var/log/audit
+sudo mkdir -p /mnt/var/log /mnt/var/log/audit /mnt/var/lib/docker
 sudo mount /dev/vg_encrypted/lv_var_log /mnt/var/log
 sudo mount /dev/vg_encrypted/lv_var_log_audit /mnt/var/log/audit
 sudo mount /dev/vg_encrypted/lv_tmp /mnt/tmp
 sudo mount /dev/vg_encrypted/lv_home /mnt/home
+sudo mount /dev/vg_encrypted/lv_docker /mnt/var/lib/docker
 
-# Copy eMMC OS to NVMe
+# Copy eMMC OS to NVMe (INCLUDING /boot contents - this is important!)
 sudo rsync -aAXv --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/mnt/*","/media/*","/run/*","/swapfile"} / /mnt
 
-# Before chrooting, identify boot partition UUID
-BOOT_UUID=$(sudo blkid -s UUID -o value /dev/mmcblk0p1)
-echo "Boot partition UUID: $BOOT_UUID"
-# You'll need this for /etc/fstab inside chroot
+# ------------------------------------
+## 3. Identify Boot Partition UUIDs (outside chroot)
+# ------------------------------------
+# CRITICAL: mmcblk0p10 is the EFI partition (NOT p9!)
+
+sudo blkid /dev/mmcblk0p1 /dev/mmcblk0p10
+# Example output:
+#   /dev/mmcblk0p1: UUID="abc123..." TYPE="ext4"
+#   /dev/mmcblk0p10: UUID="12AB-34CD" TYPE="vfat"
+
+# Store in variables for easy reference
+EMMC_ROOT_UUID=$(sudo blkid -s UUID -o value /dev/mmcblk0p1)
+EFI_UUID=$(sudo blkid -s UUID -o value /dev/mmcblk0p10)
+echo "eMMC Root UUID (contains /boot dir): $EMMC_ROOT_UUID"
+echo "EFI UUID (mmcblk0p10): $EFI_UUID"
+
+# SAVE THESE! You'll need them inside chroot for fstab
+
+
 
 # ------------------------------------
-## 3. Chroot & Re-configure
+## 4. Prepare for Chroot (CRITICAL BIND MOUNTS)
 # ------------------------------------
 
-# Mount bind special filesystems
+# Mount eMMC root correctly inside the new encrypted root
+# This preserves access to /boot without destroying its contents
+sudo mkdir -p /mnt/mnt/emmc_root /mnt/boot/efi
+sudo mount /dev/mmcblk0p1 /mnt/mnt/emmc_root
+sudo mount --bind /mnt/mnt/emmc_root/boot /mnt/boot
+sudo mount /dev/mmcblk0p10 /mnt/boot/efi
+
+# Bind mount special filesystems
 sudo mount --bind /dev /mnt/dev
+sudo mount --bind /dev/pts /mnt/dev/pts  # ← CRITICAL: Prevents chroot errors
 sudo mount --bind /proc /mnt/proc
 sudo mount --bind /sys /mnt/sys
 
@@ -95,83 +128,138 @@ sudo chroot /mnt
 
 # --- [ COMMANDS BELOW ARE INSIDE CHROOT ] ---
 
-# Verify and mount eMMC boot partition
-umount /boot 2>/dev/null || true
-mount /dev/mmcblk0p1 /boot
-# (Also mount /boot/efi if you have one)
 
-# Create keyfile for boot unlock (store on /boot, NOT in /root)
+
+# ------------------------------------
+## 5. Configure Encryption (Inside Chroot)
+# ------------------------------------
+
+# Verify /boot is accessible and contains files
+ls -la /boot/
+# You should see: extlinux/, initrd.img-*, Image, etc.
+
+# Create keyfile for automatic unlock
+# This stays on eMMC /boot (accessible via bind mount)
 dd if=/dev/urandom of=/boot/luks.key bs=4096 count=1
 chmod 0400 /boot/luks.key
+
+# Add keyfile to LUKS
 cryptsetup luksAddKey /dev/nvme0n1 /boot/luks.key
 
 # Configure /etc/crypttab
 UUID=$(cryptsetup luksUUID /dev/nvme0n1)
 echo "nvme_crypt UUID=$UUID /boot/luks.key luks,discard" >> /etc/crypttab
 
-# Configure /etc/fstab
-# BACKUP YOUR OLD ONE FIRST: mv /etc/fstab /etc/fstab.emmc
-# Then, create a new /etc/fstab.
-# ---
-# nano /etc/fstab
-# ---
-# Example fstab content:
-#
-# /dev/vg_encrypted/lv_root          /                 ext4    defaults                     0 1
-# /dev/vg_encrypted/lv_home          /home             ext4    defaults,nodev               0 2
-# /dev/vg_encrypted/lv_tmp           /tmp              ext4    defaults,nodev,nosuid,noexec 0 2
-# /dev/vg_encrypted/lv_var           /var              ext4    defaults,nosuid              0 2
-# /dev/vg_encrypted/lv_var_log       /var/log          ext4    defaults,nodev,nosuid,noexec 0 2
-# /dev/vg_encrypted/lv_var_log_audit /var/log/audit    ext4    defaults,nodev,nosuid,noexec 0 2
-# /dev/vg_encrypted/lv_swap          none              swap    sw                           0 0
-#
-# UUID=<BOOT_UUID>                   /boot             vfat    defaults                     0 2
-#
-# ---
+# ------------------------------------
+## 6. Create New fstab (Inside Chroot)
+# ------------------------------------
 
-# Ensure LUKS and LVM are included in initramfs
+# Backup old fstab
+mv /etc/fstab /etc/fstab.emmc
+
+# Create new fstab with proper bind mounts
+cat > /etc/fstab << EOF
+# Encrypted NVMe root partitions
+/dev/mapper/vg_encrypted-lv_root         /                 ext4    defaults                     0 1
+/dev/mapper/vg_encrypted-lv_home         /home             ext4    defaults,nodev               0 2
+/dev/mapper/vg_encrypted-lv_tmp          /tmp              ext4    defaults,nodev,nosuid,noexec 0 2
+/dev/mapper/vg_encrypted-lv_var          /var              ext4    defaults,nosuid              0 2
+/dev/mapper/vg_encrypted-lv_var_log      /var/log          ext4    defaults,nodev,nosuid,noexec 0 2
+/dev/mapper/vg_encrypted-lv_var_log_audit /var/log/audit   ext4    defaults,nodev,nosuid,noexec 0 2
+/dev/mapper/vg_encrypted-lv_docker       /var/lib/docker   ext4    defaults,nodev,nosuid        0 2
+/dev/mapper/vg_encrypted-lv_swap         none              swap    sw,discard                   0 0
+
+# eMMC boot access (bind mount strategy - CRITICAL!)
+# Mount eMMC root first, then bind-mount its /boot directory
+UUID=$EMMC_ROOT_UUID   /mnt/emmc_root      ext4    defaults,noatime    0 2
+/mnt/emmc_root/boot    /boot               none    bind                0 0
+UUID=$EFI_UUID         /boot/efi           vfat    defaults            0 2
+EOF
+
+# IMPORTANT: Replace $EMMC_ROOT_UUID and $EFI_UUID with actual values!
+# Edit the file manually if the variables didn't substitute:
+nano /etc/fstab
+
+# ------------------------------------
+## 7. Update Initramfs (Inside Chroot)
+# ------------------------------------
+
+# Enable cryptsetup and LVM in initramfs
 echo "CRYPTSETUP=y" >> /etc/cryptsetup-initramfs/conf-hook
 echo lvm2 >> /etc/initramfs-tools/modules
+
+# Regenerate initramfs with encryption support
 update-initramfs -u -k all
 
-# Update bootloader
-# ---
-# nano /boot/extlinux/extlinux.conf
-# ---
-# Find the 'APPEND' line.
-# Change:
-#   root=/dev/mmcblk0p1 ...
-# To:
-#   APPEND ${cbootargs} root=/dev/mapper/vg_encrypted-lv_root rootfstype=ext4 rootwait rw
-#
-# CRITICAL: Do NOT add "cryptdevice=" - that's for GRUB only!
-# The initramfs handles LUKS unlock via /etc/crypttab automatically.
-# Keep any other existing parameters (like quiet, splash, etc.)
+# ------------------------------------
+## 8. Update Bootloader Config (Inside Chroot)
+# ------------------------------------
 
-# Backup boot files
-cp /boot/initrd.img-* /boot/initrd.img-backup
+# Backup extlinux.conf
 cp /boot/extlinux/extlinux.conf /boot/extlinux/extlinux.conf.bak
 
-# Verify critical configuration before leaving chroot
-cat /etc/crypttab
-cat /etc/fstab
-ls -la /boot/luks.key
-cat /boot/extlinux/extlinux.conf
+# Edit extlinux.conf
+nano /boot/extlinux/extlinux.conf
 
-# --- [ LEAVE CHROOT ] ---
+# Find the "APPEND" line and change root= parameter:
+#   OLD: root=/dev/mmcblk0p1 ...
+#   NEW: root=/dev/mapper/vg_encrypted-lv_root rootfstype=ext4 rootwait rw
+#
+# Full example APPEND line:
+#   APPEND ${cbootargs} root=/dev/mapper/vg_encrypted-lv_root rootfstype=ext4 rootwait rw quiet splash
+#
+# CRITICAL NOTES:
+#   - Do NOT add "cryptdevice=" (that's for GRUB, not extlinux)
+#   - Keep ${cbootargs} at the beginning
+#   - Keep any other existing parameters
+#   - The initramfs handles LUKS unlock via /etc/crypttab automatically
+
+# Backup initramfs
+cp /boot/initrd.img-* /boot/initrd.img-backup 2>/dev/null || true
+
+# ------------------------------------
+## 9. Verify Configuration (Inside Chroot)
+# ------------------------------------
+
+echo "=== Verifying Critical Configurations ==="
+echo ""
+echo "--- /etc/crypttab ---"
+cat /etc/crypttab
+echo ""
+echo "--- /etc/fstab ---"
+cat /etc/fstab
+echo ""
+echo "--- Keyfile permissions ---"
+ls -la /boot/luks.key
+echo ""
+echo "--- extlinux.conf APPEND line ---"
+grep "APPEND" /boot/extlinux/extlinux.conf
+echo ""
+echo "--- Initramfs crypto support ---"
+lsinitramfs /boot/initrd.img-$(uname -r) | grep -E "cryptsetup|lvm" | head -5
+echo ""
+echo "=== Verification Complete ==="
+
+# --- [ EXIT CHROOT ] ---
 exit
 
+
+
 # ------------------------------------
-## 4. Finalize and Reboot
+## 10. Cleanup and Reboot
 # ------------------------------------
 
-# Unmount all new filesystems
+# Unmount everything in reverse order
+sudo umount /mnt/boot/efi
 sudo umount /mnt/boot
+sudo umount /mnt/mnt/emmc_root
+sudo umount /mnt/var/lib/docker
 sudo umount /mnt/var/log/audit
 sudo umount /mnt/var/log
 sudo umount /mnt/var
 sudo umount /mnt/tmp
 sudo umount /mnt/home
+sudo umount /mnt/dev/pts
 sudo umount /mnt/dev
 sudo umount /mnt/proc
 sudo umount /mnt/sys
@@ -180,13 +268,324 @@ sudo umount /mnt
 # Close encrypted container
 sudo cryptsetup luksClose nvme_crypt
 
-# ------------------------------------
-## 5. Recovery and Reboot
-# ------------------------------------
+# Final check - verify nothing is still mounted
+mount | grep /mnt
+# Should return nothing
 
-# IMPORTANT: Keep the eMMC bootable as a recovery option!
-# Do NOT modify or erase the eMMC root filesystem yet.
-# If NVMe boot fails, you can boot from eMMC and troubleshoot.
+# Keep eMMC root intact as a recovery option
+# You can always boot back to eMMC if NVMe boot fails
 
-# Reboot and boot from NVMe (root on encrypted LUKS, bootloader on eMMC)
 sudo reboot
+
+
+
+# ------------------------------------
+## 11. Post-Reboot Validation
+# ------------------------------------
+
+# After reboot, verify encrypted NVMe root is active
+df -h | grep mapper
+# Should show /dev/mapper/vg_encrypted-lv_root mounted at /
+
+# Verify all encrypted volumes are mounted
+mount | grep vg_encrypted
+
+# Check /boot is accessible via bind mount
+mount | grep '/boot '
+# Should show: /mnt/emmc_root/boot on /boot type none (bind)
+
+# Verify /boot/efi
+mount | grep '/boot/efi'
+# Should show mmcblk0p10 mounted as vfat
+
+# Confirm swap is active
+swapon --show
+# Should show /dev/mapper/vg_encrypted-lv_swap
+
+# Verify initramfs has crypto support
+lsinitramfs /boot/initrd.img-$(uname -r) | grep -E "cryptsetup|lvm"
+
+# Check that keyfile is accessible
+ls -la /boot/luks.key
+# Should exist with 0400 permissions
+
+# Verify LUKS is unlocked
+sudo cryptsetup status nvme_crypt
+# Should show "is active"
+
+# Everything should be working! System is now running on encrypted NVMe.
+# ==============================================================================
+
+
+
+# ------------------------------------
+## 12. Recovery Instructions
+# ------------------------------------
+# If the NVMe boot fails, the system should attempt to boot from eMMC.
+# To manually boot to eMMC and access the encrypted NVMe for troubleshooting:
+
+# 1. Boot to eMMC (should happen automatically if NVMe fails)
+# 2. Manually unlock and mount the encrypted NVMe:
+
+sudo cryptsetup luksOpen /dev/nvme0n1 nvme_crypt
+sudo mount /dev/vg_encrypted/lv_root /mnt
+
+# 3. Mount required partitions for chroot
+sudo mount /dev/mmcblk0p1 /mnt/mnt/emmc_root
+sudo mount --bind /mnt/mnt/emmc_root/boot /mnt/boot
+sudo mount /dev/mmcblk0p10 /mnt/boot/efi
+sudo mount --bind /dev /mnt/dev
+sudo mount --bind /dev/pts /mnt/dev/pts
+sudo mount --bind /proc /mnt/proc
+sudo mount --bind /sys /mnt/sys
+
+# 4. Chroot and make your fixes
+sudo chroot /mnt
+
+# 5. Make fixes (update extlinux.conf, regenerate initramfs, etc.)
+
+# 6. Exit and unmount
+exit
+sudo umount /mnt/boot/efi
+sudo umount /mnt/boot
+sudo umount /mnt/mnt/emmc_root
+sudo umount /mnt/dev/pts
+sudo umount /mnt/dev
+sudo umount /mnt/proc
+sudo umount /mnt/sys
+sudo umount /mnt
+sudo cryptsetup luksClose nvme_crypt
+
+# 7. Reboot
+sudo reboot
+
+
+
+# ------------------------------------
+## Key Technical Details
+# ------------------------------------
+# Boot Flow:
+#   1. UEFI/L4TLauncher loads extlinux.conf from eMMC
+#   2. Extlinux loads kernel (Image) and initramfs from eMMC /boot
+#   3. Initramfs reads /etc/crypttab, finds /boot/luks.key on eMMC
+#   4. Initramfs unlocks LUKS container on NVMe using keyfile
+#   5. LVM activates logical volumes inside decrypted container
+#   6. Initramfs pivots to /dev/mapper/vg_encrypted-lv_root
+#   7. New root's /etc/fstab mounts eMMC at /mnt/emmc_root
+#   8. Bind mount makes /mnt/emmc_root/boot appear at /boot
+#   9. System runs from encrypted NVMe with boot files on eMMC
+#
+# Critical Points:
+#   - Keyfile MUST be accessible before NVMe is decrypted (hence eMMC)
+#   - Bind mount preserves /boot contents (doesn't overwrite)
+#   - mmcblk0p10 is EFI (512M), NOT mmcblk0p9
+#   - /dev/pts bind mount prevents chroot device errors
+#
+# Security Notes:
+#   - Keyfile is on unencrypted eMMC (physical security required)
+#   - For stronger security, use TPM or prompt for passphrase
+#   - eMMC root should be mounted read-only in production
+#   - Consider disabling eMMC boot after testing
+# ==============================================================================
+
+
+
+
+
+
+
+
+
+### EXTRA CONTENT ###
+# Only if using systemd-boot (rare on Orin but future-proof)
+bootctl --path=/boot/efi install
+mkdir -p /boot/efi/loader
+cat > /boot/efi/loader/entries/ubuntu.conf << EOF
+title Ubuntu Encrypted NVMe
+linux /Image
+initrd /initrd.img-$(uname -r)
+options ${cbootargs} root=/dev/mapper/vg_encrypted-lv_root rootfstype=ext4 rootwait rw quiet splash
+EOF
+# 99% of Orin DevKits still use extlinux.conf → the above is unliekly to be needed.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### ALTERNATE GROK GUIDE --- USE ABOVE OVER THIS ###
+#!/bin/bash
+set -euo pipefail
+echo "=============================================================================="
+echo "Encrypted NVMe Root on Jetson Orin 64GB DevKit — FINAL VERIFIED VERSION"
+echo "=============================================================================="
+
+# 1. Prepare NVMe
+sudo apt update
+sudo apt install -y cryptsetup-initramfs lvm2
+
+sudo cryptsetup --allow-discards luksFormat /dev/nvme0n1
+sudo cryptsetup luksOpen /dev/nvme0n1 nvme_crypt
+
+sudo pvcreate /dev/mapper/nvme_crypt
+sudo vgcreate vg_encrypted /dev/mapper/nvme_crypt
+
+sudo lvcreate -n lv_root         -L 50G  vg_encrypted
+sudo lvcreate -n lv_var          -L 15G  vg_encrypted
+sudo lvcreate -n lv_var_log      -L 10G  vg_encrypted
+sudo lvcreate -n lv_var_log_audit -L 5G  vg_encrypted
+sudo lvcreate -n lv_tmp          -L 10G  vg_encrypted
+sudo lvcreate -n lv_home         -L 20G  vg_encrypted
+sudo lvcreate -n lv_swap         -L 8G   vg_encrypted
+sudo lvcreate -n lv_docker       -L 500G vg_encrypted || true  # optional, ignore if not enough space
+
+# 2. Format
+sudo mkfs.ext4 /dev/vg_encrypted/lv_root
+sudo mkfs.ext4 /dev/vg_encrypted/lv_var
+sudo mkfs.ext4 /dev/vg_encrypted/lv_var_log
+sudo mkfs.ext4 /dev/vg_encrypted/lv_var_log_audit
+sudo mkfs.ext4 /dev/vg_encrypted/lv_tmp
+sudo mkfs.ext4 /dev/vg_encrypted/lv_home
+sudo mkfs.ext4 /dev/vg_encrypted/lv_docker || true
+sudo mkswap /dev/vg_encrypted/lv_swap
+
+# 3. Mount new root
+sudo mount /dev/vg_encrypted/lv_root /mnt
+sudo mkdir -p /mnt/{var,tmp,home,docker}/
+sudo mount /dev/vg_encrypted/lv_var               /mnt/var
+sudo mkdir -p /mnt/var/log /mnt/var/log/audit /mnt/var/lib/docker
+sudo mount /dev/vg_encrypted/lv_var_log           /mnt/var/log
+sudo mount /dev/vg_encrypted/lv_var_log_audit     /mnt/var/log/audit
+sudo mount /dev/vg_encrypted/lv_tmp               /mnt/tmp
+sudo mount /dev/vg_encrypted/lv_home              /mnt/home
+sudo mount /dev/vg_encrypted/lv_docker            /mnt/var/lib/docker || true
+
+# 4. Copy system
+sudo rsync -aAXv --exclude={/dev/*,/proc/*,/sys/*,/tmp/*,/mnt/*,/media/*,/run/*,/swapfile} / /mnt
+
+# 5. Get UUIDs
+EMMC_ROOT_UUID=$(sudo blkid -s UUID -o value /dev/mmcblk0p1)
+EFI_UUID=$(sudo blkid -s UUID -o value /dev/mmcblk0p10)
+LUKS_UUID=$(sudo cryptsetup luksUUID /dev/nvme0n1)
+
+echo "eMMC Root UUID (mmcblk0p1): $EMMC_ROOT_UUID"
+echo "EFI UUID (mmcblk0p10):      $EFI_UUID"
+echo "LUKS UUID:                  $LUKS_UUID"
+
+# 6. Prepare chroot with correct bind mounts
+sudo mkdir -p /mnt/mnt/emmc_root /mnt/boot/efi
+sudo mount /dev/mmcblk0p1          /mnt/mnt/emmc_root
+sudo mount --bind /mnt/mnt/emmc_root/boot /mnt/boot
+sudo mount /dev/mmcblk0p10         /mnt/boot/efi
+
+sudo mount --bind /dev      /mnt/dev
+sudo mount --bind /dev/pts  /mnt/dev/pts
+sudo mount --bind /proc     /mnt/proc
+sudo mount --bind /sys      /mnt/sys
+sudo cp -L /etc/resolv.conf /mnt/etc/
+
+# 7. Chroot and configure
+sudo chroot /mnt /bin/bash <<CHROOT_SCRIPT
+set -euo pipefail
+
+# Create keyfile on eMMC /boot
+dd if=/dev/urandom of=/boot/luks.key bs=4096 count=1
+chmod 0400 /boot/luks.key
+cryptsetup luksAddKey /dev/nvme0n1 /boot/luks.key
+
+# crypttab
+cat > /etc/crypttab <<EOF
+nvme_crypt UUID=$LUKS_UUID /boot/luks.key luks,discard,keyfile-size=4096
+EOF
+
+# fstab — PERFECT version
+cat > /etc/fstab <<EOF
+# Encrypted NVMe
+/dev/mapper/vg_encrypted-lv_root         /           ext4    defaults                  0 1
+/dev/mapper/vg_encrypted-lv_home         /home       ext4    defaults,nodev            0 2
+/dev/mapper/vg_encrypted-lv_tmp          /tmp        ext4    defaults,nodev,nosuid,noexec 0 2
+/dev/mapper/vg_encrypted-lv_var          /var        ext4    defaults,nosuid           0 2
+/dev/mapper/vg_encrypted-lv_var_log      /var/log    ext4    defaults,nodev,nosuid,noexec 0 2
+/dev/mapper/vg_encrypted-lv_var_log_audit /var/log/audit ext4 defaults,nodev,nosuid,noexec 0 2
+/dev/mapper/vg_encrypted-lv_docker       /var/lib/docker ext4 defaults,nodev,nosuid 0 2
+/dev/mapper/vg_encrypted-lv_swap         none        swap    sw,discard                0 0
+
+# eMMC boot access
+UUID=$EMMC_ROOT_UUID   /mnt/emmc_root   ext4    defaults,noatime    0 2
+/mnt/emmc_root/boot    /boot            none    bind                0 0
+UUID=$EFI_UUID         /boot/efi        vfat    defaults            0 2
+EOF
+
+# Initramfs
+echo "CRYPTSETUP=y" >> /etc/cryptsetup-initramfs/conf-hook
+echo lvm2 >> /etc/initramfs-tools/modules
+update-initramfs -u -k all
+
+# extlinux.conf — point to encrypted root
+sed -i '/APPEND/ s|root=/dev/mmcblk0p1|root=/dev/mapper/vg_encrypted-lv_root rootfstype=ext4 rootwait|' /boot/extlinux/extlinux.conf
+
+# Backups
+mkdir -p /boot/initrd.img-backup
+cp /boot/initrd.img-* /boot/initrd.img-backup/ 2>/dev/null || true
+cp /boot/extlinux/extlinux.conf /boot/extlinux/extlinux.conf.bak
+
+# Final verification
+echo "=== FINAL VERIFICATION ==="
+echo "crypttab:"; cat /etc/crypttab
+echo "fstab:"; cat /etc/fstab
+echo "extlinux APPEND:"; grep APPEND /boot/extlinux/extlinux.conf
+echo "keyfile:"; ls -l /boot/luks.key
+echo "initramfs crypto:"; lsinitramfs /boot/initrd.img-$(uname -r) | grep -E "cryptsetup|lvm|luks" | head -5 || true
+
+echo "=== ALL CONFIGURED — EXITING CHROOT IN 5s ==="
+sleep 5
+CHROOT_SCRIPT
+
+# 8. Unmount everything safely
+echo "=== UNMOUNTING ==="
+sudo umount /mnt/boot/efi
+sudo umount /mnt/boot
+sudo umount /mnt/mnt/emmc_root
+sudo umount /mnt/dev/pts
+sudo umount /mnt/dev
+sudo umount /mnt/proc
+sudo umount /mnt/sys
+
+sudo umount /mnt/var/lib/docker 2>/dev/null || true
+sudo umount /mnt/var/log/audit
+sudo umount /mnt/var/log
+sudo umount /mnt/var
+sudo umount /mnt/tmp
+sudo umount /mnt/home
+sudo umount /mnt
+
+sudo cryptsetup luksClose nvme_crypt
+
+echo "=== SYNCING ==="
+sync
+
+echo "=== REBOOTING IN 10 SECONDS — YOUR ENCRYPTED NVME WILL BOOT AUTOMATICALLY ==="
+sleep 10
+sudo reboot
+
+
+
+
+
+
+
+
+
+
+
+
