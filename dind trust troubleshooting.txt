@@ -1,6 +1,3 @@
-
-
-https://gitlab.com/gitlab-org/ci-cd/runner-tools/tlsctl
 Option 0.1) Sorry for the dumb number, too lazy to re-type it.  We should try using an older dind/docker version.
 
 Option 0.2) Per this: https://docs.gitlab.com/runner/configuration/tls-self-signed/#supported-options-for-self-signed-certificates  -- there is a config variable of 'GIT_SSL_NO_VERIFY' that can be used.  Unsure if that would apply to the dind container though, but again, we hit that curl error on the runner's container outside of dind.
@@ -134,4 +131,5 @@ Remaining Questions/Comments/thoughts:
 *I still think it's worth a few tests to see the name resolution and dumping the certificate the container sees.  Although from my home PC, I can go to 
 *I'd like to save some notes when I have time on the various images, base os, etc. being used so I can test a few CA certificates/try to re-create it on my home gitlab instance.
 *There is a 'tls_cert_path' for the runners.docker, but I think that's for the trust with docker, not the trust to the registry.
+
 *Try this as a volume:  "/etc/gitlab-runner/certs/a2i2-gitlab.761link.net.crt:/certs/host:ro",       # Update the cert path to match whatever is in the toml already (the /certs/clients or whatever).
