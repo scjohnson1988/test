@@ -1,0 +1,137 @@
+
+
+https://gitlab.com/gitlab-org/ci-cd/runner-tools/tlsctl
+Option 0.1) Sorry for the dumb number, too lazy to re-type it.  We should try using an older dind/docker version.
+
+Option 0.2) Per this: https://docs.gitlab.com/runner/configuration/tls-self-signed/#supported-options-for-self-signed-certificates  -- there is a config variable of 'GIT_SSL_NO_VERIFY' that can be used.  Unsure if that would apply to the dind container though, but again, we hit that curl error on the runner's container outside of dind.
+
+Option 0.3) Per the same URL: https://docs.gitlab.com/runner/configuration/tls-self-signed/#supported-options-for-self-signed-certificates, they show this config:
+[[runners]]
+  name = "docker"
+  url = "https://example.com/"
+  token = "TOKEN"
+  executor = "docker"
+
+  # Copy and install CA certificate before each job
+  pre_build_script = """
+  apk update >/dev/null
+  apk add ca-certificates > /dev/null
+  rm -rf /var/cache/apk/*
+
+  cp /etc/gitlab-runner/certs/ca.crt /usr/local/share/ca-certificates/ca.crt
+  update-ca-certificates --fresh > /dev/null
+  
+Along with this: curl --cacert "${CI_SERVER_TLS_CA_FILE}"  ${URL} -o ${FILE}
+
+Option 0.4 ) Per this, there is a variable of 'FF_RESOLVE_FULL_TLS_CHAIN'.  It looks like this may be disabled by default, but we can toggle off the feature flag.  I also think this issue is a step after the runner.    https://docs.gitlab.com/runner/configuration/feature-flags/
+
+
+Option 1) Try to set TLS to ignore validation of the registry.  Some of the configs I got from AI, so I haven't cross-validated to ensure they actually exist.  Read comments next to each line below for details.  I wonder if we can make a new branch to test on his code?
+# Example snippet of ci config:
+services:
+  - name: docker:xx-dind   # I'm not looking at his CI file, so this is probably already there.  Think this may also be 'docker:dind:'
+#    command: ["--tls=false"]   # I believe this one fully disables TLS, so we don't want to do it
+#    command: ["--insecure-registry=registry.a2i2-gitlab.761link.net"]  # This is the better route, as it would apply to a specific repo 
+ 
+# Additional variables in the CI that may or may not be required  
+variables:
+  DOCKER_HOST: tcp://docker:2375   # Not sure if this is needed at all.
+  DOCKER_TLS_CERTDIR: ""           # Not sure we need to set this, but we could probably comment this ouit.  Some examples had this, others had the one below with the CERTDIR and CERT_PATH
+  DOCKER_TLS_VERIFY: 1             # Set to 0 to disable?
+# DOCKER_TLS_CERTDIR: "/certs"
+# DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+ 
+ 
+# This a shorter example of a possible fix above 
+variables:
+  DOCKER_TLS_CERTDIR: "/certs"   # Again, this path may need to be tweaked 
+ 
+services:
+  - name: docker:dind
+    command: 
+      - "--insecure-registry=registry.a2i2-gitlab.761link.net"
+ 
+before_script:
+  - |
+    if [ "$CI_JOB_STAGE" != "sonar-analysis" ]; then
+      # Wait for Docker daemon to be ready
+      until docker info; do sleep 1; done
+    fi
+  # Everything below should be as-is.
+  
+  
+
+Option 2) Similar to above, but this is to try to force an update of the cert store rather than ignore TLS.  Add this near the top on the ci yaml:
+before_script:
+  # Update CA certificates for Alpine
+  - apk add --no-cache ca-certificates
+  - update-ca-certificates
+ 
+# Add this maybe? Not sure it's required.
+  DOCKER_TLS_CERTDIR: ""
+ 
+ 
+ 
+ 
+Option 3) Similar to option 2, but add in some commands to try to update CA certificates within the CI container:
+services:
+  - name: docker:dind
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache ca-certificates && 
+        update-ca-certificates && 
+        dockerd-entrypoint.sh || exit 
+
+ 
+ 
+ 
+ 
+ 
+
+Option 4) Try an explicit mount of the certificate then update ca-certs.
+# Add this to the toml.
+   volumes = ["/certs/client", "/var/run/docker.sock:/var/run/docker.sock", "/docker/cache", "/etc/gitlab-runner/certs:/etc/gitlab-runner/certs:ro"]
+ 
+# As an aside, I've seen this config in the gitlab official docs:     volumes = ["/cache", "/path/to-ca-cert-dir/ca.crt:/etc/gitlab-runner/certs/ca.crt:ro"]
+   
+# Add this to the CI
+ before_script:
+     - cp /etc/gitlab-runner/certs/a2i2-gitlab.761link.net.crt /usr/local/share/ca-certificates/
+     - update-ca-certificates
+
+
+
+
+
+
+Option 5) HIGHLY unlikely this will work tbh.  Try the runners.docker.services in the config.toml.  This would apply to ALL tasks on this runner though, but we could make another runner on that server with a different name/tag to isolate it.  https://docs.gitlab.com/runner/configuration/advanced-configuration/. We'd still want the certs mounted too:
+
+  [[runners.docker.services]]
+    name = "docker:dind"
+    command = ["/bin/sh", "-c", "apk add --no-cache ca-certificates && update-ca-certificates && dockerd-entrypoint.sh || exit"]
+	
+
+
+
+
+
+Option 6) Least likely, but if it's a docker build instead of a pull, he can update the image with something like this to take the ca cert and force an update. Doubt this is worth exploring much tbh.
+COPY ca.crt /etc/pki/ca-trust/source/anchors/ca.crt
+RUN update-ca-trust extract
+
+
+
+Remaining Questions/Comments/thoughts:
+*There's an article here about self-signed certs, but I don't think anyhting listed isn't covered above: https://docs.gitlab.com/runner/configuration/tls-self-signed/#troubleshooting
+*There is a TLS tool here, but I didn't have it by default on my homelab runner (which is the free version and in a container itself): https://gitlab.com/gitlab-org/ci-cd/runner-tools/tlsctl.  I got it setup (it's a go app, so I had to install the go packages on the runner), but I don't think it really does anything unique that we need.  
+*Can we just use an entrypoint or a pipeline tweak to run 'update-ca-certificates' either via the dpkg or the command?  I have this listed above for a few options.
+*The tls_verify in the runner.docker is only for the docker daemon verification; that isn't for trusting the TLS on the registry.  This is disabled by default and it shouldn't apply.
+*Why did the curl fail on the first container I jumped it while it was running?  NOTE: I confirmed that we need to run 'docker ps' after we jump into the first docker container to view the 'dind'/internal container.  So why did that fail on the first container?
+*This has info on DOCKER_TLS_CERTDIR: https://about.gitlab.com/blog/docker-in-docker-with-docker-19-dot-03/
+*Have we tested other similar pipelines with dind to see if they work on runner2?  If so, I have a hard time understanding why we get the curl errors on those outer docker containers unless it runs a container outside of dind?
+*I still think it's worth a few tests to see the name resolution and dumping the certificate the container sees.  Although from my home PC, I can go to 
+*I'd like to save some notes when I have time on the various images, base os, etc. being used so I can test a few CA certificates/try to re-create it on my home gitlab instance.
+*There is a 'tls_cert_path' for the runners.docker, but I think that's for the trust with docker, not the trust to the registry.
+*Try this as a volume:  "/etc/gitlab-runner/certs/a2i2-gitlab.761link.net.crt:/certs/host:ro",       # Update the cert path to match whatever is in the toml already (the /certs/clients or whatever).
