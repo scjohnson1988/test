@@ -1,3 +1,47 @@
+### UPDATED NOTES ###
+Before we do anyhting, at the top of his pipeline, I see before_script: cp /etc/gitlab-runner/certs/ca.crt /usr/local/share/ca-certificates/update-ca-certificates.  I'd very that certificate is correct.  This is the 'job' container usering imaage: docker:latest.  
+
+I THINK the issue is actually the other container.  I THIIIINK the Service Container (docker:dind) is NOT trusting CA.  Here's my best guess.
+
+We will want to add these two to the volumes to the runner.toml:
+      # mount CA for docker daemon dind service for our internal registry.  Docker Daemon prefers a bundle.
+      "/etc/gitlab-runner/certs/a2i2-bundle.crt:/etc/docker/certs.d/registry.a2i2-gitlab.761link.net/ca.crt:ro",
+      # Mount CA for Git/Curl on the Job Container.  If this fails, split it into individual certs and move it to something like: /usr/local/share/ca-certificates/a2i2-root.crt (and repeat for int.crt)
+      "/etc/gitlab-runner/certs/a2i2-bundle.crt:/tmp/a2i2-bundle.crt:ro"
+
+For the certificate itself, I wanna say it looks like we can use a chain like this:
+-----BEGIN CERTIFICATE-----
+int ca here
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+root CA here
+-----END CERTIFICATE-----
+
+If not, or if you want to be safe, you can make 
+
+Go to the ci yml.
+What I am NOT 100% sure on is if we should set this back to whatever it was, like: DOCKER_TLS_CERTDIR: "/certs".  I'd run it first as-is with "".
+
+Edit the ci config to something like this:
+before_script:
+  # 1) add curl if needed. this is probably unnecessary, but the || true will skip it if it's there already.
+  - apk add --no-cache curl || true
+
+  # 2) Update OS certs
+  # NOTE: I think the 'cp /etc/gitlab-runenr/certs/ca.crt /usr/local/share/ca-certificates/ is not needed due to the mount bind
+  # I think since we're going to try to append the certs to ca-certificates.crt, this update-ca-certifcates isn't really needed.
+  # If this fails, we'll probably need to mount the root and int CA separately along with the bundle and store those in a way that update-ca-certificates will work
+  - cat /tmp/a2i2-bundle.crt >> /etc/ssl/certs/ca-certificates.crt
+  - update-ca-certificates
+
+  # 3) Verify - expect a 200 or 401.  If SSL fails, look for an exit code.
+  - echo "### DEBUG TRUST TEST ###"
+  - curl -v https://registry.a2i2-gitlab.761link.net/v2/
+
+  # 4) Leave everything else at the '| <line break> if ["$CI_JOB_STAGE"....' as-is.
+
+
+#### ORIGINAL NOTES ###
 Option 0.1) Sorry for the dumb number, too lazy to re-type it.  We should try using an older dind/docker version.
 
 Option 0.2) Per this: https://docs.gitlab.com/runner/configuration/tls-self-signed/#supported-options-for-self-signed-certificates  -- there is a config variable of 'GIT_SSL_NO_VERIFY' that can be used.  Unsure if that would apply to the dind container though, but again, we hit that curl error on the runner's container outside of dind.
@@ -131,5 +175,4 @@ Remaining Questions/Comments/thoughts:
 *I still think it's worth a few tests to see the name resolution and dumping the certificate the container sees.  Although from my home PC, I can go to 
 *I'd like to save some notes when I have time on the various images, base os, etc. being used so I can test a few CA certificates/try to re-create it on my home gitlab instance.
 *There is a 'tls_cert_path' for the runners.docker, but I think that's for the trust with docker, not the trust to the registry.
-
 *Try this as a volume:  "/etc/gitlab-runner/certs/a2i2-gitlab.761link.net.crt:/certs/host:ro",       # Update the cert path to match whatever is in the toml already (the /certs/clients or whatever).
