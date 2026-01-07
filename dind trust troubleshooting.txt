@@ -1,3 +1,11 @@
+### FIX ###
+1) Create a CA bundle with both internal and external intermidate and root CAs.  In addition, create four individual files for each CA.
+2) Update the gitlab runner to use this:
+volumes = ["/certs/client/", "/etc/gitlab-runner/certs/gitlab-bundle.crt:/etc/gitlab-runner/certs/ca.crt:ro", "/var/run/docker.sock:/var/run/docker.sock", "/docker/cache", "/etc/gitlab-runner/certs/ca.crt:/usr/local/share/ca-certificates/ca-root.crt:ro", "/etc/gitlab-runner/certs/ca-int.crt:/usr/local/share/ca-certificates/ca-int.crt:ro", "/etc/gitlab-runner/certs/ecs-ca.crt:/usr/local/share/ca-certificates/ecs-ca.crt:ro", "/etc/gitlab-runner/certs/ecs-int.crt:/usr/local/share/ca-certificates/ecs-int.crt:ro", "/etc/gitlab-runner/certs/gitlab-bundle.crt:/etc/docker/certs.d/registry.a2i2-gitlab.761link.net/ca.crt:ro", "/etc/gitlab-runner/certs/gitlab-bundle.crt:/usr/local/share/ca-certificates/gitlab-bundle.crt:ro"]
+
+2a) The certs from Step 1 must align with Step 2
+
+
 ### UPDATED NOTES ###
 Before we do anyhting, at the top of his pipeline, I see before_script: cp /etc/gitlab-runner/certs/ca.crt /usr/local/share/ca-certificates/update-ca-certificates.  I'd very that certificate is correct.  This is the 'job' container usering imaage: docker:latest.  
 
