@@ -242,22 +242,22 @@ configure_sysctls() {
         sed -i 's/^\(user\.max_user_namespaces\s*=\s*0\)$/# DISABLED for rootless Docker: \1/' /etc/sysctl.conf
     fi
 
-    cat > /etc/sysctl.d/51-rootless.conf <<EOF
+    cat > /etc/sysctl.d/99-rootless-docker.conf <<EOF
 user.max_user_namespaces = 28633
 EOF
 
     if [[ "$ENABLE_IP_FORWARD" == "true" ]]; then
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.d/51-rootless.conf
+        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.d/99-rootless-docker.conf
     fi
 
     # Debian/Ubuntu userns clone check (optional)
     if sysctl -n kernel.unprivileged_userns_clone &>/dev/null; then
-        echo "kernel.unprivileged_userns_clone=1" >> /etc/sysctl.d/51-rootless.conf
+        echo "kernel.unprivileged_userns_clone=1" >> /etc/sysctl.d/99-rootless-docker.conf
     fi
 
     # Only present on Debian/Ubuntu kernels, not RHEL/Alma
     if sysctl -n kernel.unprivileged_userns_clone &>/dev/null; then
-        echo "kernel.unprivileged_userns_clone=1" >> /etc/sysctl.d/51-rootless.conf
+        echo "kernel.unprivileged_userns_clone=1" >> /etc/sysctl.d/99-rootless-docker.conf
     fi
 
     sysctl --system > /dev/null 2>&1
