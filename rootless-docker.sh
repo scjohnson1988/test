@@ -24,6 +24,7 @@ REMOTE_SYSLOG_ADDRESS="udp://10.74.4.3:514"
 STORAGE_DRIVER="" # Auto-detects based on OS/SELinux
 DISABLE_ICC=false # Set to true to enforce CIS benchmark in daemon.json (may require troubleshooting on RHEL8 and likely will not work)
 APPLY_SELINUX_FIXES=true # Automatically create a temporary SELinux module for any denials that may have been detected 
+ENABLE_IP_FORWARD=true # Generally a good idea to leave this enabled, as it is no longer a STIG to ahve it on 
 
 # Color codes
 RED='\033[0;31m'
@@ -130,14 +131,19 @@ handle_selinux_end() {
 load_kernel_modules() {
     print_status "Loading required kernel modules..."
 
+	# nf_tables preferred for RHEL8+ networking
+	# ip_tables included for backward compatibility with legacy tools
     modprobe overlay || print_warning "Failed to load overlay"
     modprobe br_netfilter || print_warning "Failed to load br_netfilter"
     modprobe nf_tables || print_warning "Failed to load nf_tables"
+	modprobe ip_tables || print_warning "ip_tables module missing or already loaded"
+
 
     cat > /etc/modules-load.d/docker-rootless.conf <<EOF
 overlay
 br_netfilter
 nf_tables
+ip_tables
 EOF
 
 # RHEL8 / AlmaLinux: ensure ip_tables module is loaded for rootless Docker
@@ -167,11 +173,10 @@ install_dependencies() {
     case $PACKAGE_MANAGER in
         apt-get)
             $PACKAGE_MANAGER update
-            $PACKAGE_MANAGER install -y docker-ce docker-ce-rootless-extras uidmap dbus-user-session iptables
+            $PACKAGE_MANAGER install -y docker-ce docker-ce-rootless-extras uidmap dbus-user-session
             ;;
         dnf|yum)
-            # iptables is explicitly needed for rootless networking, even on RHEL8 (it uses iptables-nft)
-            $PACKAGE_MANAGER install -y docker-ce docker-ce-rootless-extras shadow-utils fuse-overlayfs iptables
+            $PACKAGE_MANAGER install -y docker-ce docker-ce-rootless-extras shadow-utils fuse-overlayfs
             ;;
     esac
 }
@@ -239,9 +244,16 @@ configure_sysctls() {
 
     cat > /etc/sysctl.d/51-rootless.conf <<EOF
 user.max_user_namespaces = 28633
-# Required for rootless network bridging
-net.ipv4.ip_forward=1
 EOF
+
+    if [[ "$ENABLE_IP_FORWARD" == "true" ]]; then
+        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.d/51-rootless.conf
+    fi
+
+    # Debian/Ubuntu userns clone check (optional)
+    if sysctl -n kernel.unprivileged_userns_clone &>/dev/null; then
+        echo "kernel.unprivileged_userns_clone=1" >> /etc/sysctl.d/51-rootless.conf
+    fi
 
     # Only present on Debian/Ubuntu kernels, not RHEL/Alma
     if sysctl -n kernel.unprivileged_userns_clone &>/dev/null; then
@@ -329,43 +341,6 @@ fi
 EOF
 }
 
-
-    run_as_user "$DOCKER_USER" <<EOF
-set -eux
-dockerd-rootless-setuptool.sh uninstall -f || true
-rm -rf ~/.local/share/docker ~/.config/docker || true
-
-# Execute the main rootless install
-dockerd-rootless-setuptool.sh install
-
-mkdir -p ~/.config/docker
-cat > ~/.config/docker/daemon.json <<'JSON'
-${DAEMON_JSON}
-JSON
-
-systemctl --user daemon-reload
-systemctl --user enable docker
-systemctl --user restart docker
-
-# Ensure Docker CLI uses rootless context (instead of relying on DOCKER_HOST)
-docker context use rootless 2>/dev/null || true
-
-# Make sure environments hydrate when switching to this user via 'su'
-if ! grep -q "XDG_RUNTIME_DIR" ~/.bash_profile; then
-cat >> ~/.bash_profile <<'BASHRC_EOF'
-
-# --- Rootless Docker Environment Variables ---
-# Required so 'su - user' properly connects to the systemd bus
-if [[ -z "\$XDG_RUNTIME_DIR" ]]; then
-    export XDG_RUNTIME_DIR="/run/user/\$(id -u)"
-    export DBUS_SESSION_BUS_ADDRESS="unix:path=\${XDG_RUNTIME_DIR}/bus"
-fi
-# TESTING NATIVE CONFIGS:
-#export DOCKER_HOST="unix://\${XDG_RUNTIME_DIR}/docker.sock"
-BASHRC_EOF
-fi
-EOF
-}
 
 validate_setup() {
     print_status "Validating rootless Docker setup..."
