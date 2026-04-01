@@ -10,21 +10,31 @@
 #To fix the above error, run modprobe br_netfilter as root (verify via checking /proc/sys/net/bridge/bridge-nf-call-iptables)
 #To check the CONTEXT of docker, run: docker context.  You can also run 'docker context inspect rootless' top view more information on it.
 #To EDIT the context of docker, run (update as needed): docker context update rootless --docker "host=unix:///run/user/1003/docker.sock"
-#For RHEL8, it may not be possible to use DISABLE_ICC.
+
+# RHEL NON-COMPLIANT CIS CONFIGS #
+# When running the bench as rootless, there is a warning of: [WARN] Some tests might require root to run -- this applies to the below out.
+#2.2 (CIS) - For RHEL8, there is no traditional docker0 bridge exists in rootless mode and icc only applies to bridge networking in rootful Docker.  There is a variable below (DISABLE_ICC) to control it. This works fine on Ubuntu.
+#2.9 (user namespace support/userns-remap): This config is a false-positive for RHEL rootless, as subuids and subgids are already used and rootless docker is already using usier namespaces.  This is only necessary when running rootful docker.
+#2.12 (authorization-plugins) - This requires 
+#2.14 (no-new-privileges) - This appears to be a false-positive issue.  If you run 'docker info | grep no-new-privileges', it shows that it's enabled.  
+#2.16 (userland-proxy) - As Rootless Docker is using RootlessKit networking (slirp4netns/pasta) on RHEL, userland-proxy is irrelevant.  The script should set this value in the daemon.json config, which is the only available evidence that can be offered (grep userland-proxy /home/a2i2.docker/.config/docker/daemon.json)
+
+
 
 set -euo pipefail
 trap 'echo "[ERROR] Line $LINENO failed"' ERR
 
 # ---- CONFIGURATION ----
 DOCKER_USER="a2i2.docker"
-CUSTOM_DATA_ROOT="/docker/docker"  # Set to absolute path if desired, leave empty for default
+CUSTOM_DATA_ROOT="/docker"  # Set to absolute path if desired, leave empty for default
 ADD_TO_DOCKER_GROUP=true
 USE_REMOTE_LOGGING=true
 REMOTE_SYSLOG_ADDRESS="udp://10.74.4.3:514"
 STORAGE_DRIVER="" # Auto-detects based on OS/SELinux
-DISABLE_ICC=false # Set to true to enforce CIS benchmark in daemon.json (may require troubleshooting on RHEL8 and likely will not work)
+DISABLE_ICC=false # APPLIES TO RHEL-ONLY: Set to true to enforce CIS benchmark in daemon.json (may require troubleshooting on RHEL8 and likely will not work)
 APPLY_SELINUX_FIXES=true # Automatically create a temporary SELinux module for any denials that may have been detected 
-ENABLE_IP_FORWARD=true # Generally a good idea to leave this enabled, as it is no longer a STIG to ahve it on 
+ENABLE_IP_FORWARD=true # Generally a good idea to leave this enabled, as it is no longer a STIG to have it on 
+FIX_SYSCTL_NAMESPACES=true  # Set to true to comment out user.max_user_namespaces=0 in /etc/sysctl.d/99-sysctl.conf/.  This may remove OS compliance, but will not work with rootless docker otherise.
 
 # Color codes
 RED='\033[0;31m'
@@ -136,7 +146,6 @@ load_kernel_modules() {
     modprobe overlay || print_warning "Failed to load overlay"
     modprobe br_netfilter || print_warning "Failed to load br_netfilter"
     modprobe nf_tables || print_warning "Failed to load nf_tables"
-	modprobe ip_tables || print_warning "ip_tables module missing or already loaded"
 
 
     cat > /etc/modules-load.d/docker-rootless.conf <<EOF
@@ -173,10 +182,10 @@ install_dependencies() {
     case $PACKAGE_MANAGER in
         apt-get)
             $PACKAGE_MANAGER update
-            $PACKAGE_MANAGER install -y docker-ce docker-ce-rootless-extras uidmap dbus-user-session
+            $PACKAGE_MANAGER install -y docker-ce docker-ce-rootless-extras uidmap dbus-user-session jq
             ;;
         dnf|yum)
-            $PACKAGE_MANAGER install -y docker-ce docker-ce-rootless-extras shadow-utils fuse-overlayfs
+            $PACKAGE_MANAGER install -y docker-ce docker-ce-rootless-extras shadow-utils fuse-overlayfs jq
             ;;
     esac
 }
@@ -201,6 +210,37 @@ verify_user() {
 verify_binaries() {
     print_status "Verifying required binaries..."
     command -v dockerd-rootless-setuptool.sh >/dev/null || { print_error "dockerd-rootless-setuptool.sh not found"; exit 1; }
+}
+
+verify_network_driver() {
+    # pasta is preferred on RHEL9+ and modern Ubuntu; slirp4netns is the fallback for RHEL8
+    if command -v pasta &>/dev/null; then
+        print_success "pasta (passt) network driver found — preferred driver available"
+        return 0
+    fi
+
+    print_status "pasta not found — checking slirp4netns..."
+
+    local SLIRP4NETNS_BIN
+    if SLIRP4NETNS_BIN="$(command -v slirp4netns)"; then
+        local SLIRP_VERSION
+        SLIRP_VERSION=$(slirp4netns --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+
+        if [[ -z "$SLIRP_VERSION" ]]; then
+            print_warning "Could not determine slirp4netns version — proceeding anyway"
+            return 0
+        fi
+
+        if [[ $(printf '0.4.0\n%s' "$SLIRP_VERSION" | sort -V | head -n1) == "0.4.0" ]]; then
+            print_success "slirp4netns $SLIRP_VERSION found (>= 0.4.0 required)"
+        else
+            print_error "slirp4netns $SLIRP_VERSION is too old (< 0.4.0 required)"
+            exit 1
+        fi
+    else
+        print_error "Neither pasta nor slirp4netns found — rootless Docker networking will fail"
+        exit 1
+    fi
 }
 
 setup_apparmor_profile() {
@@ -233,32 +273,48 @@ EOF
     fi
 }
 
+# Used to ensure 'user.max_user_namespaces=0 ' is not set
+fix_sysctl_namespace_conf() {
+    [[ "$FIX_SYSCTL_NAMESPACES" != "true" ]] && return 0
+
+    local SYSCTL_CONF="/etc/sysctl.d/99-sysctl.conf"
+    [[ ! -f "$SYSCTL_CONF" ]] && return 0
+
+    if grep -qE '^\s*user\.max_user_namespaces\s*=\s*0' "$SYSCTL_CONF"; then
+        print_status "Commenting out user.max_user_namespaces=0 in $SYSCTL_CONF (CCE-82211-4 override)..."
+        sed -i 's|^\(\s*user\.max_user_namespaces\s*=\s*0\)|# Commented out for rootless Docker (was: \1)|' "$SYSCTL_CONF"
+        print_success "Commented out restrictive namespace setting in $SYSCTL_CONF"
+    else
+        print_status "No restrictive user.max_user_namespaces=0 found in $SYSCTL_CONF — skipping"
+    fi
+}
+
 configure_sysctls() {
-    if ! grep -qiE "rhel|alma|centos|rocky|fedora" /etc/os-release 2>/dev/null; then return 0; fi
+    if ! grep -qiE "rhel|alma|centos|rocky|fedora" /etc/os-release 2>/dev/null; then
+        return 0
+    fi
 
     print_status "Configuring kernel parameters for rootless Docker..."
 
+    # Comment out any existing restrictive namespace setting in sysctl.conf
     if grep -q "^user\.max_user_namespaces\s*=\s*0" /etc/sysctl.conf 2>/dev/null; then
         sed -i 's/^\(user\.max_user_namespaces\s*=\s*0\)$/# DISABLED for rootless Docker: \1/' /etc/sysctl.conf
     fi
 
-    SYSCTL_FILE="/etc/sysctl.d/99-rootless-docker.conf"
-    cat > "$SYSCTL_FILE" <<EOF
-user.max_user_namespaces = 28633
-EOF
+    # Write rootless Docker sysctl settings
+    local SYSCTL_FILE="/etc/sysctl.d/99-rootless-docker.conf"
+    {
+        echo "user.max_user_namespaces = 28633"
+        [[ "$ENABLE_IP_FORWARD" == "true" ]] && echo "net.ipv4.ip_forward = 1"
+        # Debian/Ubuntu only — harmless no-op on RHEL if not present
+        sysctl -n kernel.unprivileged_userns_clone &>/dev/null && echo "kernel.unprivileged_userns_clone = 1"
+    } > "$SYSCTL_FILE"
 
-    if [[ "$ENABLE_IP_FORWARD" == "true" ]]; then
-        echo "net.ipv4.ip_forward=1" >> "$SYSCTL_FILE"
-    fi
-
-    # Debian/Ubuntu only
-    if sysctl -n kernel.unprivileged_userns_clone &>/dev/null; then
-        echo "kernel.unprivileged_userns_clone=1" >> "$SYSCTL_FILE"
-    fi
-
+    # Apply immediately without waiting for reboot
     sysctl -w user.max_user_namespaces=28633
-
     sysctl --system > /dev/null 2>&1
+
+    print_success "Kernel parameters configured"
 }
 
 
@@ -268,68 +324,170 @@ remove_docker_config() {
     fi
 }
 
+# This creates daemon.json for RHEL
+build_daemon_json_rhel() {
+    local storage_driver="$1"
+    local log_driver="$2"
+    local syslog_address="$3"
+    local data_root="$4"
+
+    local base
+    base=$(jq -n \
+        --arg sd "$storage_driver" \
+        --arg ld "$log_driver" \
+        --arg dr "$data_root" \
+        '{
+            "no-new-privileges": true,
+            "experimental": false,
+            "userland-proxy": false,
+            "storage-driver": $sd,
+            "live-restore": true,
+            "log-level": "info",
+            "log-driver": $ld,
+            "data-root": $dr,
+            "default-ulimits": {
+                "nofile": {
+                    "Name": "nofile",
+                    "Soft": 64000,
+                    "Hard": 64000
+                }
+            }
+        }')
+
+    if [[ "$log_driver" == "syslog" ]]; then
+        base=$(echo "$base" | jq --arg addr "$syslog_address" \
+            '. + {"log-opts": {"syslog-address": $addr}}')
+    else
+        base=$(echo "$base" | jq \
+            '. + {"log-opts": {"max-size": "256m", "max-file": "3"}}')
+    fi
+
+    [[ "$DISABLE_ICC" == "true" ]] && base=$(echo "$base" | jq '. + {"icc": false}')
+
+    echo "$base"
+}
+
+# This creates daemon.json for Ubuntu hosts
+build_daemon_json_ubuntu() {
+    local storage_driver="$1"
+    local log_driver="$2"
+    local syslog_address="$3"
+    local data_root="$4"
+
+    local base
+    base=$(jq -n \
+        --arg sd "$storage_driver" \
+        --arg ld "$log_driver" \
+        --arg dr "$data_root" \
+        '{
+            "experimental": false,
+            "no-new-privileges": true,
+            "userland-proxy": false,
+            "selinux-enabled": false,
+            "icc": false,
+            "storage-driver": $sd,
+            "live-restore": true,
+            "cgroup-parent": "",
+            "log-level": "info",
+            "log-driver": $ld,
+            "data-root": $dr,
+            "insecure-registries": [],
+            "default-ulimits": {
+                "nofile": {
+                    "Name": "nofile",
+                    "Soft": 64000,
+                    "Hard": 64000
+                }
+            }
+        }')
+
+    if [[ "$log_driver" == "syslog" ]]; then
+        base=$(echo "$base" | jq --arg addr "$syslog_address" \
+            '. + {"log-opts": {"syslog-address": $addr}}')
+    else
+        base=$(echo "$base" | jq \
+            '. + {"log-opts": {"max-size": "256m", "max-file": "3"}}')
+    fi
+
+    [[ "$DISABLE_ICC" == "true" ]] && base=$(echo "$base" | jq '. + {"icc": false}')
+
+    echo "$base"
+}
+
 setup_rootless_docker() {
     print_status "Setting up rootless Docker for $DOCKER_USER..."
-    
+
+    local user_home
+    user_home=$(getent passwd "$DOCKER_USER" | cut -d: -f6)
+
     if [[ -n "$CUSTOM_DATA_ROOT" ]]; then
         mkdir -p "$CUSTOM_DATA_ROOT"
         chown "$DOCKER_USER:$DOCKER_USER" "$CUSTOM_DATA_ROOT"
     fi
 
-    local LOG_DRIVER LOG_OPTS
-    if [[ "$USE_REMOTE_LOGGING" == "true" ]]; then
-        LOG_DRIVER="syslog"
-        LOG_OPTS="\"syslog-address\": \"$REMOTE_SYSLOG_ADDRESS\""
-    else
-        LOG_DRIVER="local"
-        LOG_OPTS="\"max-size\": \"256m\", \"max-file\": \"3\""
-    fi
-    
+    local LOG_DRIVER
+    LOG_DRIVER=$([[ "$USE_REMOTE_LOGGING" == "true" ]] && echo "syslog" || echo "local")
+
     if [[ -z "$STORAGE_DRIVER" ]]; then
-        if command -v getenforce &>/dev/null && [[ "$(getenforce)" != "Disabled" ]]; then
+        if [[ "$OS" =~ ubuntu|debian ]]; then
+            STORAGE_DRIVER="overlay2"
+        elif command -v getenforce &>/dev/null && [[ "$(getenforce)" != "Disabled" ]]; then
             STORAGE_DRIVER="fuse-overlayfs"
         else
             STORAGE_DRIVER="overlay2"
         fi
     fi
 
-    local OPTIONAL_JSON=""
-    [[ -n "$CUSTOM_DATA_ROOT" ]] && OPTIONAL_JSON+=$',\n  "data-root": "'"$CUSTOM_DATA_ROOT"'"'
-    [[ "$DISABLE_ICC" == "true" ]] && OPTIONAL_JSON+=$',\n  "icc": false'
-
     local DAEMON_JSON
-    DAEMON_JSON=$(cat <<JSONEOF
-{
-  "no-new-privileges": true,
-  "userland-proxy": false,
-  "storage-driver": "$STORAGE_DRIVER",
-  "log-driver": "$LOG_DRIVER",
-  "log-opts": { $LOG_OPTS }$OPTIONAL_JSON
-}
-JSONEOF
-)
+    if [[ "$OS" =~ ubuntu|debian ]]; then
+        DAEMON_JSON=$(build_daemon_json_ubuntu \
+            "$STORAGE_DRIVER" "$LOG_DRIVER" "$REMOTE_SYSLOG_ADDRESS" "$CUSTOM_DATA_ROOT")
+    else
+        DAEMON_JSON=$(build_daemon_json_rhel \
+            "$STORAGE_DRIVER" "$LOG_DRIVER" "$REMOTE_SYSLOG_ADDRESS" "$CUSTOM_DATA_ROOT")
+    fi
 
-    run_as_user "$DOCKER_USER" <<EOF
+    # Wipe old data before writing fresh config
+    rm -rf "${user_home}/.local/share/docker" "${user_home}/.config/docker" || true
+
+    # Write daemon.json as root
+    mkdir -p "${user_home}/.config/docker"
+    echo "$DAEMON_JSON" > "${user_home}/.config/docker/daemon.json"
+    chown -R "$DOCKER_USER:$DOCKER_USER" "${user_home}/.config/docker"
+
+    # Write systemd override as root BEFORE switching users
+    local override_dir="${user_home}/.config/systemd/user/docker.service.d"
+    mkdir -p "$override_dir"
+
+    if [[ "$OS" =~ rhel|alma|centos|rocky|fedora ]]; then
+        cat > "${override_dir}/override.conf" <<CONF_EOF
+[Service]
+Environment=DOCKER_IGNORE_BR_NETFILTER_ERROR=1
+Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_PORT_DRIVER=slirp4netns
+CONF_EOF
+    else
+        cat > "${override_dir}/override.conf" <<CONF_EOF
+[Service]
+Environment=DOCKER_IGNORE_BR_NETFILTER_ERROR=1
+CONF_EOF
+    fi
+
+    chown -R "$DOCKER_USER:$DOCKER_USER" "${user_home}/.config/systemd"
+
+    # Now switch to user context
+    run_as_user "$DOCKER_USER" <<'EOF'
 set -eux
 dockerd-rootless-setuptool.sh uninstall -f || true
-rm -rf ~/.local/share/docker ~/.config/docker || true
-
 dockerd-rootless-setuptool.sh install
 
-mkdir -p ~/.config/docker
-cat > ~/.config/docker/daemon.json <<'JSON'
-${DAEMON_JSON}
-JSON
-
+systemctl --user reset-failed docker.service 2>/dev/null || true
 systemctl --user daemon-reload
 systemctl --user enable docker
 systemctl --user restart docker
-
 docker context use rootless 2>/dev/null || true
 
 if ! grep -q "XDG_RUNTIME_DIR" ~/.bash_profile; then
-cat >> ~/.bash_profile <<'BASHRC_EOF'
-
+cat >> ~/.bash_profile <<BASHRC_EOF
 # --- Rootless Docker Environment Variables ---
 if [[ -z "\$XDG_RUNTIME_DIR" ]]; then
     export XDG_RUNTIME_DIR="/run/user/\$(id -u)"
@@ -339,6 +497,7 @@ BASHRC_EOF
 fi
 EOF
 }
+
 
 
 validate_setup() {
@@ -369,7 +528,9 @@ main() {
     install_dependencies
     verify_user
     verify_binaries
+	verify_network_driver
     setup_apparmor_profile
+	fix_sysctl_namespace_conf
     configure_sysctls
     remove_docker_config
     setup_rootless_docker
