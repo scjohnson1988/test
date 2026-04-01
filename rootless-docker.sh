@@ -26,7 +26,7 @@ trap 'echo "[ERROR] Line $LINENO failed"' ERR
 
 # ---- CONFIGURATION ----
 DOCKER_USER="a2i2.docker"
-CUSTOM_DATA_ROOT="/docker"  # Set to absolute path if desired, leave empty for default
+CUSTOM_DATA_ROOT="/docker/docker"  # Set to absolute path if desired, leave empty for default
 ADD_TO_DOCKER_GROUP=true
 USE_REMOTE_LOGGING=true
 REMOTE_SYSLOG_ADDRESS="udp://10.74.4.3:514"
