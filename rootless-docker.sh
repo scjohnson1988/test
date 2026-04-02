@@ -583,6 +583,8 @@ setup_docker_audit_rules() {
     local user_home
     user_home=$(getent passwd "${DOCKER_USER}" | cut -d: -f6)
     if [[ -n "$user_home" ]]; then
+	    #add_rule "$user_home/.local/share/docker"  # Enable if needed; may generate excess noise.
+		#add_rule "/run/user/$uid/docker.sock" wa docker  # useful for partiy to rootful docker, but will be very noisy and not overly helpful.
         add_rule "$user_home/.config/docker"
         add_rule "$user_home/.config/systemd/user/docker.service"
         add_rule "$user_home/.config/systemd/user/docker.service.d"
