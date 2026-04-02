@@ -13,6 +13,8 @@
 
 # RHEL NON-COMPLIANT CIS CONFIGS #
 # When running the bench as rootless, there is a warning of: [WARN] Some tests might require root to run -- this applies to the below out.
+# You can review the logic used in the bench by reviewing the bash scripts: https://github.com/docker/docker-bench-security/blob/master/tests/2_docker_daemon_configuration.sh
+
 #2.2 (CIS) - For RHEL8, there is no traditional docker0 bridge exists in rootless mode and icc only applies to bridge networking in rootful Docker.  There is a variable below (DISABLE_ICC) to control it. This works fine on Ubuntu.
 #2.9 (user namespace support/userns-remap): This config is a false-positive for RHEL rootless, as subuids and subgids are already used and rootless docker is already using usier namespaces.  This is only necessary when running rootful docker.
 #2.12 (authorization-plugins) - This requires 
@@ -34,7 +36,8 @@ STORAGE_DRIVER="" # Auto-detects based on OS/SELinux
 DISABLE_ICC=false # APPLIES TO RHEL-ONLY: Set to true to enforce CIS benchmark in daemon.json (may require troubleshooting on RHEL8 and likely will not work)
 APPLY_SELINUX_FIXES=true # Automatically create a temporary SELinux module for any denials that may have been detected 
 ENABLE_IP_FORWARD=true # Generally a good idea to leave this enabled, as it is no longer a STIG to have it on 
-FIX_SYSCTL_NAMESPACES=true  # Set to true to comment out user.max_user_namespaces=0 in /etc/sysctl.d/99-sysctl.conf/.  This may remove OS compliance, but will not work with rootless docker otherise.
+FIX_SYSCTL_NAMESPACES=true  # Set to true to comment out user.max_user_namespaces=0 in /etc/sysctl.d/99-sysctl.conf/.  This may remove OS compliance, but will not work with rootless docker otherwise.
+SETUP_AUDIT_RULES=false # This is experimental.  If enabled, it will perform a best-effort attempt to create root and rootless audit rules.  If not enabled, this will be required by the user running the script.
 
 # Color codes
 RED='\033[0;31m'
@@ -146,7 +149,11 @@ load_kernel_modules() {
     modprobe overlay || print_warning "Failed to load overlay"
     modprobe br_netfilter || print_warning "Failed to load br_netfilter"
     modprobe nf_tables || print_warning "Failed to load nf_tables"
-
+    modprobe ip_tables || print_warning "Failed to load ip_tables"
+	
+    # Ensure the bridge-nf path actually exists before we try to sysctl it
+    # This triggers the kernel to "realize" the bridge parameters are there
+    ls /proc/sys/net/bridge/bridge-nf-call-iptables >/dev/null 2>&1 || true
 
     cat > /etc/modules-load.d/docker-rootless.conf <<EOF
 overlay
@@ -290,27 +297,38 @@ fix_sysctl_namespace_conf() {
 }
 
 configure_sysctls() {
-    if ! grep -qiE "rhel|alma|centos|rocky|fedora" /etc/os-release 2>/dev/null; then
-        return 0
-    fi
-
     print_status "Configuring kernel parameters for rootless Docker..."
 
-    # Comment out any existing restrictive namespace setting in sysctl.conf
-    if grep -q "^user\.max_user_namespaces\s*=\s*0" /etc/sysctl.conf 2>/dev/null; then
-        sed -i 's/^\(user\.max_user_namespaces\s*=\s*0\)$/# DISABLED for rootless Docker: \1/' /etc/sysctl.conf
-    fi
-
-    # Write rootless Docker sysctl settings
+    # ---- Applies to ALL distros ----
     local SYSCTL_FILE="/etc/sysctl.d/99-rootless-docker.conf"
+
     {
         echo "user.max_user_namespaces = 28633"
+
+        # Enable user namespaces where supported (Ubuntu/Debian)
+        if sysctl -n kernel.unprivileged_userns_clone &>/dev/null; then
+            echo "kernel.unprivileged_userns_clone = 1"
+        fi
+
         [[ "$ENABLE_IP_FORWARD" == "true" ]] && echo "net.ipv4.ip_forward = 1"
-        # Debian/Ubuntu only — harmless no-op on RHEL if not present
-        sysctl -n kernel.unprivileged_userns_clone &>/dev/null && echo "kernel.unprivileged_userns_clone = 1"
     } > "$SYSCTL_FILE"
 
-    # Apply immediately without waiting for reboot
+    # ---- RHEL-specific adjustments ----
+    if grep -qiE "rhel|alma|centos|rocky|fedora" /etc/os-release 2>/dev/null; then
+
+        # Comment out restrictive setting if present
+        if grep -q "^user\.max_user_namespaces\s*=\s*0" /etc/sysctl.conf 2>/dev/null; then
+            sed -i 's/^\(user\.max_user_namespaces\s*=\s*0\)$/# DISABLED for rootless Docker: \1/' /etc/sysctl.conf
+        fi
+
+        # CIS-related bridge settings (harmless even if unused in rootless)
+        echo "net.bridge.bridge-nf-call-iptables = 1" >> "$SYSCTL_FILE"
+        echo "net.bridge.bridge-nf-call-ip6tables = 1" >> "$SYSCTL_FILE"
+
+        modprobe br_netfilter || true
+    fi
+
+    # Apply immediately
     sysctl -w user.max_user_namespaces=28633
     sysctl --system > /dev/null 2>&1
 
@@ -519,6 +537,80 @@ fi
 EOF
 }
 
+# NOTE: This is not very well tested.  It must be opted into.
+setup_docker_audit_rules() {
+    print_status "Configuring auditd rules for Docker (rootful + rootless)..."
+
+    local RULE_FILE="/etc/audit/rules.d/docker-audit.rules"
+    local TMP_FILE
+    TMP_FILE=$(mktemp)
+
+    add_rule() {
+        local path="$1"
+        local perms="${2:-wa}"
+        local key="${3:-docker}"
+        [[ -z "$path" ]] && return
+
+        if ! grep -Fxq -- "-w $path -p $perms -k $key" "$TMP_FILE" 2>/dev/null; then
+            echo "-w $path -p $perms -k $key" >> "$TMP_FILE"
+        fi
+    }
+
+    # === Core binaries ===
+    add_rule /usr/bin/docker
+    add_rule /usr/bin/dockerd
+    add_rule /usr/bin/dockerd-rootless.sh
+    add_rule /usr/bin/containerd
+    add_rule /usr/bin/containerd-shim
+    add_rule /usr/bin/containerd-shim-runc-v1
+    add_rule /usr/bin/containerd-shim-runc-v2
+    add_rule /usr/bin/runc
+
+    # === Rootful paths ===
+    add_rule /var/lib/docker
+    add_rule /etc/docker
+    add_rule /etc/docker/daemon.json
+    add_rule /etc/containerd/config.toml
+    add_rule /etc/default/docker
+    add_rule /etc/sysconfig/docker
+    add_rule /usr/lib/systemd/system/docker.service
+    add_rule /usr/lib/systemd/system/docker.socket
+    add_rule /run/containerd
+    add_rule /run/containerd/containerd.sock
+    add_rule /var/run/docker.sock
+
+    # === Rootless paths ===
+    local user_home
+    user_home=$(getent passwd "${DOCKER_USER}" | cut -d: -f6)
+    if [[ -n "$user_home" ]]; then
+        add_rule "$user_home/.config/docker"
+        add_rule "$user_home/.config/systemd/user/docker.service"
+        add_rule "$user_home/.config/systemd/user/docker.service.d"
+    fi
+
+    local uid
+    uid=$(id -u "$DOCKER_USER" 2>/dev/null || true)
+    if [[ -n "$uid" ]]; then
+        add_rule "/run/user/$uid/docker.sock"
+    fi
+
+    # === Install ===
+    sort -u "$TMP_FILE" > "$RULE_FILE"
+    chmod 640 "$RULE_FILE"
+    chown root:root "$RULE_FILE"
+    rm -f "$TMP_FILE"
+
+    if command -v augenrules >/dev/null; then
+        augenrules --load
+    else
+        print_warning "augenrules not found — loading rules temporarily with auditctl"
+        auditctl -R "$RULE_FILE"
+    fi
+
+    print_success "Auditd rules for Docker configured successfully"
+}
+
+
 main() {
     print_status "Starting rootless Docker setup..."
     detect_os
@@ -528,15 +620,23 @@ main() {
     install_dependencies
     verify_user
     verify_binaries
-	verify_network_driver
+    verify_network_driver
     setup_apparmor_profile
-	fix_sysctl_namespace_conf
+    fix_sysctl_namespace_conf
     configure_sysctls
     remove_docker_config
     setup_rootless_docker
     validate_setup
+
+    if [[ "$SETUP_AUDIT_RULES" == "true" ]]; then
+        setup_docker_audit_rules
+    else
+        print_warning "Skipping audit rule configuration (SETUP_AUDIT_RULES=false)"
+    fi
+
     handle_selinux_end
     print_success "Setup complete! Access the user cleanly with: sudo su - $DOCKER_USER"
 }
+
 
 main "$@"
