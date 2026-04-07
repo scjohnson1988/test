@@ -38,6 +38,8 @@ APPLY_SELINUX_FIXES=true # Automatically create a temporary SELinux module for a
 ENABLE_IP_FORWARD=true # Generally a good idea to leave this enabled, as it is no longer a STIG to have it on 
 FIX_SYSCTL_NAMESPACES=true  # Set to true to comment out user.max_user_namespaces=0 in /etc/sysctl.d/99-sysctl.conf/.  This may remove OS compliance, but will not work with rootless docker otherwise.
 SETUP_AUDIT_RULES=false # This is experimental.  If enabled, it will perform a best-effort attempt to create root and rootless audit rules.  If not enabled, this will be required by the user running the script.
+SETUP_NVIDIA_RUNTIME=false  # Set to true to configure NVIDIA container runtime.  This is necessary to allow rootless docker containers to access the GPU.
+NVIDIA_SET_DEFAULT_RUNTIME=true  # Set to true to also set nvidia as default-runtime.  This is ignored if SETUP_NVIDIA_RUNTIME is not set to true.
 
 # Color codes
 RED='\033[0;31m'
@@ -517,6 +519,61 @@ EOF
 }
 
 
+setup_nvidia_runtime() {
+    [[ "$SETUP_NVIDIA_RUNTIME" != "true" ]] && return 0
+
+    print_status "Configuring NVIDIA container runtime..."
+
+    if ! command -v nvidia-ctk &>/dev/null; then
+        print_error "nvidia-ctk not found — install the NVIDIA Container Toolkit first:"
+        print_error "  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
+        return 1
+    fi
+
+    local user_home
+    user_home=$(getent passwd "$DOCKER_USER" | cut -d: -f6)
+    local daemon_json="${user_home}/.config/docker/daemon.json"
+
+    if [[ ! -f "$daemon_json" ]]; then
+        print_error "daemon.json not found at $daemon_json — run setup_rootless_docker first"
+        return 1
+    fi
+
+    local nvidia_ctk_args=(
+        runtime configure
+        --runtime=docker
+        --config="$daemon_json"
+    )
+    [[ "$NVIDIA_SET_DEFAULT_RUNTIME" == "true" ]] && nvidia_ctk_args+=(--set-as-default)
+
+    sudo -H -u "$DOCKER_USER" nvidia-ctk "${nvidia_ctk_args[@]}"
+
+    # Safe ownership fix — nvidia-ctk may write as a different uid depending on sudo context
+    chown "$DOCKER_USER:$DOCKER_USER" "$daemon_json" 2>/dev/null || true
+
+    print_success "NVIDIA runtime configured in $daemon_json"
+    print_status "Restarting Docker for $DOCKER_USER to apply changes..."
+
+    run_as_user "$DOCKER_USER" <<'EOF'
+systemctl --user restart docker
+EOF
+
+    print_success "Docker restarted with NVIDIA runtime support"
+
+    # Must run after restart per NVIDIA rootless docs — modifies /etc/nvidia-container-runtime/config.toml
+    nvidia-ctk config --set nvidia-container-cli.no-cgroups --in-place
+
+    print_status "Validating NVIDIA runtime registration..."
+
+    run_as_user "$DOCKER_USER" <<'EOF'
+if docker info 2>/dev/null | grep -i "nvidia" | grep -i "runtime"; then
+    echo "[✓] NVIDIA runtime confirmed in docker info"
+else
+    echo "[!] NVIDIA runtime not detected — check daemon.json and restart manually if needed"
+fi
+EOF
+}
+
 
 validate_setup() {
     print_status "Validating rootless Docker setup..."
@@ -628,6 +685,7 @@ main() {
     configure_sysctls
     remove_docker_config
     setup_rootless_docker
+	setup_nvidia_runtime 
     validate_setup
 
     if [[ "$SETUP_AUDIT_RULES" == "true" ]]; then
