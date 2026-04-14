@@ -6,8 +6,7 @@
 ### GENERAL NOTES ###
 #Always use './rootless-docker.sh' or 'bash rootless-docker.sh'; do NOT use 'sh'.
 #A great troubleshooting tool is to run 'dockerd-rootless.sh' as the user
-#If you have network errors, either add this 'Environment=DOCKER_IGNORE_BR_NETFILTER_ERROR=1' to [Service] section here /home/a2i2.docker/.config/systemd/user as a workaround
-#To fix the above error, run modprobe br_netfilter as root (verify via checking /proc/sys/net/bridge/bridge-nf-call-iptables)
+#If you are using containerd under version 2.0 on RHEL/Alma 8 and docker fails to start, ensure you are using the RHEL repo and not the centos repo: https://download.docker.com/linux/rhel/8/x86_64/stable/Packages/
 #To check the CONTEXT of docker, run: docker context.  You can also run 'docker context inspect rootless' top view more information on it.
 #To EDIT the context of docker, run (update as needed): docker context update rootless --docker "host=unix:///run/user/1003/docker.sock"
 
@@ -15,7 +14,6 @@
 # When running the bench as rootless, there is a warning of: [WARN] Some tests might require root to run -- this applies to the below out.
 # You can review the logic used in the bench by reviewing the bash scripts: https://github.com/docker/docker-bench-security/blob/master/tests/2_docker_daemon_configuration.sh
 
-#2.2 (CIS) - For RHEL8, there is no traditional docker0 bridge exists in rootless mode and icc only applies to bridge networking in rootful Docker.  There is a variable below (DISABLE_ICC) to control it. This works fine on Ubuntu.
 #2.9 (user namespace support/userns-remap): This config is a false-positive for RHEL rootless, as subuids and subgids are already used and rootless docker is already using usier namespaces.  This is only necessary when running rootful docker.
 #2.12 (authorization-plugins) - This requires 
 #2.14 (no-new-privileges) - This appears to be a false-positive issue.  If you run 'docker info | grep no-new-privileges', it shows that it's enabled.  
@@ -33,7 +31,7 @@ ADD_TO_DOCKER_GROUP=true
 USE_REMOTE_LOGGING=true
 REMOTE_SYSLOG_ADDRESS="udp://10.74.4.3:514"
 STORAGE_DRIVER="" # Auto-detects based on OS/SELinux
-DISABLE_ICC=false # APPLIES TO RHEL-ONLY: Set to true to enforce CIS benchmark in daemon.json (may require troubleshooting on RHEL8 and likely will not work)
+DISABLE_ICC=true # RHEL-ONLY: Should almost always be true, as it is a CIS requirement.  Set to false if you're using RHEL8 and have and have an older version of Docker.  Ubuntu 22.04 should always have this as 'true'.
 APPLY_SELINUX_FIXES=true # Automatically create a temporary SELinux module for any denials that may have been detected 
 ENABLE_IP_FORWARD=true # Generally a good idea to leave this enabled, as it is no longer a STIG to have it on 
 FIX_SYSCTL_NAMESPACES=true  # Set to true to comment out user.max_user_namespaces=0 in /etc/sysctl.d/99-sysctl.conf/.  This may remove OS compliance, but will not work with rootless docker otherwise.
@@ -429,8 +427,6 @@ build_daemon_json_ubuntu() {
             '. + {"log-opts": {"max-size": "256m", "max-file": "3"}}')
     fi
 
-    [[ "$DISABLE_ICC" == "true" ]] && base=$(echo "$base" | jq '. + {"icc": false}')
-
     echo "$base"
 }
 
@@ -484,6 +480,7 @@ setup_rootless_docker() {
 [Service]
 Environment=DOCKER_IGNORE_BR_NETFILTER_ERROR=1
 Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_PORT_DRIVER=slirp4netns
+Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns
 CONF_EOF
     else
         cat > "${override_dir}/override.conf" <<CONF_EOF
