@@ -1,0 +1,93 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: cloudflared
+  labels:
+    app.kubernetes.io/name: cloudflared
+    app.kubernetes.io/component: tunnel-connector
+spec:
+  # Each replica is an independent connector for the same tunnel, so two replicas give redundancy across node failures and rolling updates.
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflared
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Bring a new connector up before taking an old one down so the tunnel always has at least one live connection.
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloudflared
+        app.kubernetes.io/component: tunnel-connector
+    spec:
+      # cloudflared never talks to the Kubernetes API, so no service account token is mounted.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # 65532 is the distroless "nonroot" user the upstream image is built with; adjust if your mirrored image differs.
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          # Prefer spreading replicas across nodes, but still schedule if only one node is available.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: cloudflared
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: cloudflared
+          # Replace with the internal registry mirror and a pinned version that has cleared review; the tag shown is an example, not a recommendation of a specific release.
+          image: registry.example.internal/cloudflare/cloudflared:2024.12.2
+          imagePullPolicy: IfNotPresent
+          args:
+            - tunnel
+            # Updates are handled by changing the image tag, not by the binary replacing itself inside the container.
+            - --no-autoupdate
+            # Exposes Prometheus metrics and the /ready endpoint used by the liveness probe.
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+          env:
+            # Token for a remotely-managed tunnel; ingress rules live in the Cloudflare dashboard/API, not in this manifest.
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cloudflared-tunnel-token
+                  key: token
+          ports:
+            - name: metrics
+              containerPort: 2000
+              protocol: TCP
+          livenessProbe:
+            # /ready returns 200 only while the connector holds at least one active connection to the Cloudflare edge.
+            httpGet:
+              path: /ready
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            # Starting values for a light-traffic tunnel; tune from observed usage.
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
